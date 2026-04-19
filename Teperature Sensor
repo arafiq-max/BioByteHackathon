@@ -1,0 +1,83 @@
+import serial
+import time
+import requests
+
+ser = serial.Serial('COM4', 9600, timeout=10)
+time.sleep(3)
+ser.flushInput()
+
+SAMPLE_INTERVAL = 10   # seconds between readings
+TOTAL_DURATION  = 60  # 5 minutes in seconds
+MAX_SAMPLES     = TOTAL_DURATION // SAMPLE_INTERVAL  # 30 readings
+
+readings = []
+sample_count = 0
+start_time = time.time()
+
+print(f"Starting {TOTAL_DURATION}s session — collecting {MAX_SAMPLES} readings every {SAMPLE_INTERVAL}s...")
+print("-" * 60)
+
+while sample_count < MAX_SAMPLES:
+    elapsed = time.time() - start_time
+    remaining = TOTAL_DURATION - elapsed
+    print(f"[{sample_count+1}/{MAX_SAMPLES}] Waiting for reading... ({int(remaining)}s remaining)")
+
+    try:
+        raw = ser.readline()
+        line = raw.decode('utf-8', errors='ignore').strip()
+
+        if not line:
+            continue
+
+        if line.startswith('#'):
+            print(f"Arduino: {line}")
+            continue
+
+        parts = line.split(',')
+
+        if len(parts) == 5:
+            payload = {
+                "timestamp": time.time(),
+                "temp_c": float(parts[1]),
+                "temp_f": float(parts[2]),
+                "humidity": float(parts[3]),
+                "heat_event": int(parts[4])
+            }
+            readings.append(payload)
+            sample_count += 1
+            print(f"✓ Temp: {payload['temp_c']}C | Humidity: {payload['humidity']}% | Heat Event: {payload['heat_event']}")
+
+            # Uncomment when website is ready:
+            # requests.post("http://your-website.com/api/temperature", json=payload)
+
+            # Wait for next sample interval before reading again
+            time.sleep(SAMPLE_INTERVAL)
+
+        else:
+            print(f"⚠ Incomplete line ({len(parts)} parts): {line}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(1)
+
+# Session complete — print summary
+print("\n" + "=" * 60)
+print(f"Session complete — {len(readings)} readings collected")
+print("=" * 60)
+
+if readings:
+    temps = [r['temp_c'] for r in readings]
+    print(f"Avg temp : {sum(temps)/len(temps):.2f}C")
+    print(f"Max temp : {max(temps):.2f}C")
+    print(f"Min temp : {min(temps):.2f}C")
+    heat_events = sum(1 for r in readings if r['heat_event'] == 1)
+    print(f"Heat events: {heat_events}/{len(readings)} readings")
+
+# Save to CSV
+import csv
+csv_path = "temperature_session.csv"
+with open(csv_path, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=["timestamp", "temp_c", "temp_f", "humidity", "heat_event"])
+    writer.writeheader()
+    writer.writerows(readings)
+print(f"\nData saved to {csv_path}")
