@@ -1,0 +1,43 @@
+import serial
+import time
+import requests
+
+ser = serial.Serial('COM4', 9600, timeout=10)
+time.sleep(3)
+
+ser.flushInput()  # clear any partial data sitting in buffer
+
+print("Listening for temperature data...")
+
+while True:
+    try:
+        raw = ser.readline()  # waits for full \n terminated line
+        line = raw.decode('utf-8', errors='ignore').strip()
+        
+        if not line:
+            continue
+            
+        if line.startswith('#'):
+            print(f"Arduino: {line}")
+            continue
+
+        print(f"Raw line: '{line}'")  # show exactly what came in
+
+        parts = line.split(',')
+        print(f"Parts count: {len(parts)} | Parts: {parts}")  # debug
+
+        if len(parts) == 5:
+            payload = {
+                "timestamp": time.time(),
+                "temp_c": float(parts[1]),
+                "temp_f": float(parts[2]),
+                "humidity": float(parts[3]),
+                "heat_event": int(parts[4])
+            }
+            print(f"✓ Temp: {payload['temp_c']}C | Humidity: {payload['humidity']}% | Heat Event: {payload['heat_event']}")
+        else:
+            print(f"⚠ Expected 5 parts, got {len(parts)}: {line}")
+
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(1)
