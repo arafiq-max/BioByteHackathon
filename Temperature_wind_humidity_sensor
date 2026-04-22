@@ -1,84 +1,64 @@
+"""
+Weather ML Pipeline
+====================
+Train on up to 6 CSV files, then analyze any test CSV to compute:
+  - Heat Index
+  - Wind Chill
+  - Comfort Index
+  - Rain Probability  (Random Forest classifier)
+  - Pressure Trend
+  - Condition Rating
 
-# ML pipeline for 6 training CSVs + 1 input CSV
-# - Upload 6 historical CSVs to train
-# - Upload 1 new CSV to analyze
-# - Extract temp/rain trends
-# - Predict rain occurrence and rain amount
-# - Save report, predictions, plots, and trained models
+Usage
+-----
+  python weather_ml_pipeline.py \
+      --train  data1.csv data2.csv data3.csv \
+      --test   new_data.csv \
+      --output results/
 
-# =========================
-# 1) Install / Imports
-# =========================
-!pip -q install joblib imbalanced-learn
+Dependencies
+------------
+  pip install pandas numpy scikit-learn imbalanced-learn joblib matplotlib
+"""
 
-import io
-import os
-import re
+# ─────────────────────────────────────────────────────────────
+#  1.  Imports
+# ─────────────────────────────────────────────────────────────
+import argparse
 import json
 import math
-import joblib
+import os
+import re
+import sys
 import warnings
+
+import joblib
+import matplotlib
+matplotlib.use("Agg")          # headless – safe for servers / Colab
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
-from google.colab import files
-from IPython.display import display
-
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    roc_auc_score,
-    mean_absolute_error,
-    r2_score,
+    accuracy_score, f1_score, mean_absolute_error,
+    precision_score, r2_score, recall_score, roc_auc_score,
 )
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 
 warnings.filterwarnings("ignore")
 
-OUTPUT_DIR = "weather_results"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-# =========================
-# 2) Upload training files
-# =========================
-print("Upload your 6 historical/training CSV files")
-uploaded_train = files.upload()
-
-train_file_names = list(uploaded_train.keys())
-if len(train_file_names) < 1:
-    raise ValueError("Please upload at least 1 training CSV.")
-
-print(f"Training files uploaded: {train_file_names}")
-
-
-# =========================
-# 3) Upload new input file
-# =========================
-print("Upload 1 new input CSV file to analyze")
-uploaded_input = files.upload()
-
-input_file_names = list(uploaded_input.keys())
-if len(input_file_names) != 1:
-    raise ValueError("Please upload exactly 1 input CSV for analysis.")
-
-input_file_name = input_file_names[0]
-print(f"Input file uploaded: {input_file_name}")
-
-
-# =========================
-# 4) Helpers
-# =========================
+# ─────────────────────────────────────────────────────────────
+#  2.  Column-detection helpers  (mirrors original Python code)
+# ─────────────────────────────────────────────────────────────
 def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [
@@ -88,7 +68,7 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def find_column(df: pd.DataFrame, candidates):
+def find_column(df: pd.DataFrame, candidates: list) -> str | None:
     cols = list(df.columns)
     for cand in candidates:
         for c in cols:
@@ -106,77 +86,79 @@ def coerce_numeric(series: pd.Series) -> pd.Series:
 
 
 def parse_datetime_column(df: pd.DataFrame):
-    dt_candidates = [
-        "timestamp", "datetime", "date_time", "time", "date", "datetime_utc"
-    ]
+    dt_candidates = ["timestamp", "datetime", "date_time", "time", "date", "datetime_utc"]
     dt_col = find_column(df, dt_candidates)
     if dt_col:
-        parsed = pd.to_datetime(df[dt_col], errors="coerce")
+        parsed = pd.to_datetime(df[dt_col], errors="coerce", unit="s")
+        # fallback: try without unit (ISO strings)
+        if parsed.notna().sum() == 0:
+            parsed = pd.to_datetime(df[dt_col], errors="coerce")
         if parsed.notna().sum() > 0:
             return dt_col, parsed
     return None, None
 
 
+# ─────────────────────────────────────────────────────────────
+#  3.  Feature engineering  (mirrors original Python code)
+# ─────────────────────────────────────────────────────────────
 def standardize_weather_df(df: pd.DataFrame, source_name: str = "unknown") -> pd.DataFrame:
     df = clean_columns(df)
 
-    temp_col     = find_column(df, ["temperature", "temp_f", "temp", "air_temperature", "outdoor_temperature"])
-    humidity_col = find_column(df, ["humidity", "relative_humidity", "rh"])
-    rain_col     = find_column(df, ["rain", "rainfall", "precip", "precipitation", "rain_mm", "precipitation_mm"])
-    wind_col     = find_column(df, ["wind_speed", "windspeed", "wind"])
-    pressure_col = find_column(df, ["pressure", "barometric_pressure"])
-    solar_col    = find_column(df, ["solar_radiation", "solar", "radiation"])
+    temp_col      = find_column(df, ["temperature", "temp_f", "temp", "air_temperature", "outdoor_temperature"])
+    humidity_col  = find_column(df, ["humidity", "relative_humidity", "rh"])
+    rain_col      = find_column(df, ["rain", "rainfall", "precip", "precipitation", "rain_mm", "precipitation_mm"])
+    wind_col      = find_column(df, ["wind_speed", "windspeed", "wind"])
+    pressure_col  = find_column(df, ["pressure", "barometric_pressure"])
+    solar_col     = find_column(df, ["solar_radiation", "solar", "radiation"])
 
     dt_col, parsed_dt = parse_datetime_column(df)
 
     out = pd.DataFrame(index=df.index)
     out["source_file"] = source_name
 
-    # --- Timestamp & cyclical time encoding ---
+    # Timestamp & cyclical encoding
     if dt_col is not None:
         out["timestamp"]  = parsed_dt
         hour              = parsed_dt.dt.hour
         month             = parsed_dt.dt.month
         out["dayofweek"]  = parsed_dt.dt.dayofweek
         out["is_weekend"] = parsed_dt.dt.dayofweek.isin([5, 6]).astype(float)
-
-        # Sine/cosine encoding so hour 23 → 0 and Dec → Jan wrap correctly
         out["hour_sin"]   = np.sin(2 * np.pi * hour  / 24)
         out["hour_cos"]   = np.cos(2 * np.pi * hour  / 24)
         out["month_sin"]  = np.sin(2 * np.pi * month / 12)
         out["month_cos"]  = np.cos(2 * np.pi * month / 12)
     else:
-        out["timestamp"]  = pd.NaT
+        out["timestamp"] = pd.NaT
         for c in ["hour_sin", "hour_cos", "month_sin", "month_cos", "dayofweek", "is_weekend"]:
             out[c] = np.nan
 
-    # --- Core meteorological inputs ---
-    out["temperature"]    = coerce_numeric(df[temp_col])     if temp_col     else np.nan
-    out["humidity"]       = coerce_numeric(df[humidity_col]) if humidity_col else np.nan
-    out["wind_speed"]     = coerce_numeric(df[wind_col])     if wind_col     else np.nan
-    out["pressure"]       = coerce_numeric(df[pressure_col]) if pressure_col else np.nan
-    out["solar_radiation"]= coerce_numeric(df[solar_col])    if solar_col    else np.nan
+    # Core meteorological inputs
+    out["temperature"]     = coerce_numeric(df[temp_col])     if temp_col     else np.nan
+    out["humidity"]        = coerce_numeric(df[humidity_col]) if humidity_col else np.nan
+    out["wind_speed"]      = coerce_numeric(df[wind_col])     if wind_col     else np.nan
+    out["pressure"]        = coerce_numeric(df[pressure_col]) if pressure_col else np.nan
+    out["solar_radiation"] = coerce_numeric(df[solar_col])    if solar_col    else np.nan
 
-    # --- Rain is used for LABELS ONLY — never as a model input ---
+    # Rain → labels only (never model input)
     out["rain_amount"] = coerce_numeric(df[rain_col]).fillna(0) if rain_col else 0.0
     out["rain_flag"]   = (out["rain_amount"] > 0).astype(int)
 
-    # --- Interaction features (no rain terms) ---
-    out["temp_x_humidity"]    = out["temperature"] * out["humidity"]
+    # Interaction features
+    out["temp_x_humidity"]   = out["temperature"] * out["humidity"]
     out["temp_minus_humidity"] = out["temperature"] - out["humidity"]
 
-    # --- Dew-point approximation (Magnus formula proxy) ---
+    # Dew-point (Magnus proxy)
     T = out["temperature"]
     H = out["humidity"].clip(1, 100)
     out["dewpoint"] = T - ((100 - H) / 5.0)
 
-    # --- Lag features: temp & humidity only ---
+    # Lag features
     out["temp_lag1"]     = out["temperature"].shift(1)
     out["temp_lag2"]     = out["temperature"].shift(2)
     out["humidity_lag1"] = out["humidity"].shift(1)
     out["humidity_lag2"] = out["humidity"].shift(2)
 
-    # --- Rolling statistics (3-step window, no rain) ---
+    # Rolling statistics (3-step window)
     out["temp_roll3_mean"] = out["temperature"].rolling(3, min_periods=1).mean()
     out["temp_roll3_std"]  = out["temperature"].rolling(3, min_periods=1).std()
     out["hum_roll3_mean"]  = out["humidity"].rolling(3, min_periods=1).mean()
@@ -184,100 +166,7 @@ def standardize_weather_df(df: pd.DataFrame, source_name: str = "unknown") -> pd
     return out
 
 
-def load_csv_from_uploaded(upload_dict_key, upload_dict):
-    return pd.read_csv(io.BytesIO(upload_dict[upload_dict_key]))
-
-
-# =========================
-# 5) Load and standardize training data
-# =========================
-train_frames = []
-for fname in train_file_names:
-    raw_df = load_csv_from_uploaded(fname, uploaded_train)
-    std_df = standardize_weather_df(raw_df, source_name=fname)
-    train_frames.append(std_df)
-
-train_df = pd.concat(train_frames, ignore_index=True)
-display(train_df.head())
-
-print("Training shape:", train_df.shape)
-print("Rain rows:", int(train_df["rain_flag"].sum()))
-print("Rain frequency:", round(train_df["rain_flag"].mean() * 100, 4), "%")
-
-
-# =========================
-# 6) Trend analysis on training data
-# =========================
-trend_lines = []
-trend_lines.append(f"Training rows: {len(train_df)}")
-trend_lines.append(f"Training files: {len(train_file_names)}")
-trend_lines.append(f"Rain rows: {int(train_df['rain_flag'].sum())}")
-trend_lines.append(f"Rain frequency (%): {train_df['rain_flag'].mean() * 100:.4f}")
-
-for col, label in [("temperature", "temperature"), ("humidity", "humidity")]:
-    if train_df[col].notna().sum() > 0:
-        trend_lines.append(f"Average {label} overall: {train_df[col].mean():.2f}")
-    rain_vals = train_df.loc[train_df["rain_flag"] == 1, col].dropna()
-    if len(rain_vals) > 0:
-        trend_lines.append(f"Average {label} when raining: {rain_vals.mean():.2f}")
-
-corr_temp_rain     = train_df[["temperature", "rain_amount"]].corr(numeric_only=True).iloc[0, 1]
-corr_humidity_rain = train_df[["humidity",    "rain_amount"]].corr(numeric_only=True).iloc[0, 1]
-trend_lines.append(f"Correlation: temperature vs rain_amount = {corr_temp_rain:.4f}")
-trend_lines.append(f"Correlation: humidity vs rain_amount = {corr_humidity_rain:.4f}")
-
-hourly_rain = train_df.groupby("hour_sin", dropna=True)["rain_flag"].mean().reset_index()
-if len(hourly_rain) > 0:
-    best_hour = hourly_rain.sort_values("rain_flag", ascending=False).iloc[0]
-    trend_lines.append(f"Highest rain likelihood by hour_sin bucket: {best_hour['hour_sin']:.3f} "
-                       f"({best_hour['rain_flag'] * 100:.2f}%)")
-
-report_path = os.path.join(OUTPUT_DIR, "training_trend_report.txt")
-with open(report_path, "w") as f:
-    f.write("\n".join(trend_lines))
-
-print("\n".join(trend_lines))
-
-
-# =========================
-# 7) Visualize training trends
-# =========================
-plt.figure(figsize=(8, 5))
-plot_df = train_df.dropna(subset=["temperature", "rain_amount"])
-plt.scatter(plot_df["temperature"], plot_df["rain_amount"], alpha=0.5)
-plt.xlabel("Temperature")
-plt.ylabel("Rain Amount")
-plt.title("Temperature vs Rain Amount (training)")
-plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "temp_vs_rain.png"), dpi=200)
-plt.show()
-
-# Correlation heatmap — label columns excluded
-numeric_cols_for_corr = [
-    "temperature", "humidity", "wind_speed", "pressure", "solar_radiation",
-    "dayofweek", "is_weekend",
-    "hour_sin", "hour_cos", "month_sin", "month_cos",
-    "temp_x_humidity", "temp_minus_humidity", "dewpoint",
-    "temp_lag1", "temp_lag2", "humidity_lag1", "humidity_lag2",
-    "temp_roll3_mean", "temp_roll3_std", "hum_roll3_mean",
-]
-corr_matrix = train_df[numeric_cols_for_corr].corr(numeric_only=True)
-
-plt.figure(figsize=(12, 9))
-plt.imshow(corr_matrix, aspect="auto", cmap="coolwarm", vmin=-1, vmax=1)
-plt.xticks(range(len(corr_matrix.columns)), corr_matrix.columns, rotation=90)
-plt.yticks(range(len(corr_matrix.index)), corr_matrix.index)
-plt.colorbar()
-plt.title("Feature Correlation Heatmap (no rain inputs)")
-plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "correlation_heatmap.png"), dpi=200)
-plt.show()
-
-
-# =========================
-# 8) Feature list — rain completely absent
-# =========================
-feature_cols = [
+FEATURE_COLS = [
     "temperature", "humidity", "wind_speed", "pressure", "solar_radiation",
     "dayofweek", "is_weekend",
     "hour_sin", "hour_cos", "month_sin", "month_cos",
@@ -288,233 +177,433 @@ feature_cols = [
     "source_file",
 ]
 
-X       = train_df[feature_cols].copy()
-y_class = train_df["rain_flag"].astype(int)
-y_reg   = train_df["rain_amount"].astype(float)
-
-numeric_features     = [c for c in feature_cols if c != "source_file"]
-categorical_features = ["source_file"]
-
-numeric_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="median")),
-    ("scaler",  StandardScaler()),
-])
-
-categorical_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="most_frequent")),
-    ("onehot",  OneHotEncoder(handle_unknown="ignore")),
-])
-
-preprocessor = ColumnTransformer(transformers=[
-    ("num", numeric_transformer,     numeric_features),
-    ("cat", categorical_transformer, categorical_features),
-])
-
-# Classifier: SMOTE for class imbalance + balanced RF
-clf_pipeline = ImbPipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("smote",        SMOTE(random_state=42, k_neighbors=3)),
-    ("model",        RandomForestClassifier(
-        n_estimators=300,
-        class_weight="balanced",
-        max_features="sqrt",
-        min_samples_leaf=5,
-        random_state=42,
-    )),
-])
-
-reg_pipeline = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("model",        RandomForestRegressor(n_estimators=200, random_state=42)),
-])
+NUMERIC_FEATURES     = [c for c in FEATURE_COLS if c != "source_file"]
+CATEGORICAL_FEATURES = ["source_file"]
 
 
-# =========================
-# 9) Time-series cross-validation
-# =========================
-tscv = TimeSeriesSplit(n_splits=5)
+# ─────────────────────────────────────────────────────────────
+#  4.  Meteorological index formulas
+# ─────────────────────────────────────────────────────────────
+def heat_index(temp_f: float, rh: float) -> float | None:
+    """NOAA Rothfusz regression – only meaningful above 80 °F."""
+    if pd.isna(temp_f) or pd.isna(rh):
+        return None
+    if temp_f < 80:
+        return round(temp_f, 1)
+    hi = (
+        -42.379
+        + 2.04901523 * temp_f
+        + 10.14333127 * rh
+        - 0.22475541 * temp_f * rh
+        - 6.83783e-3  * temp_f ** 2
+        - 5.481717e-2 * rh ** 2
+        + 1.22874e-3  * temp_f ** 2 * rh
+        + 8.5282e-4   * temp_f * rh ** 2
+        - 1.99e-6     * temp_f ** 2 * rh ** 2
+    )
+    return round(hi, 1)
 
-all_acc, all_prec, all_rec, all_f1, all_auc = [], [], [], [], []
-last_y_te, last_pred, last_prob = None, None, None
 
-for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
-    X_tr, X_te = X.iloc[train_idx],       X.iloc[test_idx]
-    y_tr, y_te = y_class.iloc[train_idx], y_class.iloc[test_idx]
+def wind_chill(temp_f: float, wind_mph: float) -> float | None:
+    """NWS wind-chill formula – active below 50 °F with wind > 3 mph."""
+    if pd.isna(temp_f) or pd.isna(wind_mph):
+        return None
+    if temp_f > 50 or wind_mph < 3:
+        return round(temp_f, 1)
+    wc = (
+        35.74
+        + 0.6215 * temp_f
+        - 35.75  * wind_mph ** 0.16
+        + 0.4275 * temp_f * wind_mph ** 0.16
+    )
+    return round(wc, 1)
 
-    if len(y_tr.unique()) < 2 or len(y_te.unique()) < 2:
-        print(f"  Fold {fold} — skipped (single class in split)")
-        continue
 
-    clf_pipeline.fit(X_tr, y_tr)
-    pred = clf_pipeline.predict(X_te)
-    prob = clf_pipeline.predict_proba(X_te)[:, 1]
+def comfort_index(temp_f: float, rh: float, wind_mph: float | None) -> float | None:
+    """0–100 score: 100 = perfect comfort (~70 °F, ~50 % RH, ~8 mph wind)."""
+    if pd.isna(temp_f) or pd.isna(rh):
+        return None
+    temp_score = max(0, 100 - abs(temp_f - 70) * 3)
+    hum_score  = max(0, 100 - abs(rh - 50) * 1.5)
+    wind_score = max(0, 100 - abs((wind_mph if not pd.isna(wind_mph) else 8) - 8) * 4)
+    return round(temp_score * 0.45 + hum_score * 0.35 + wind_score * 0.20, 1)
 
-    all_acc.append(accuracy_score(y_te, pred))
-    all_prec.append(precision_score(y_te, pred, zero_division=0))
-    all_rec.append(recall_score(y_te, pred, zero_division=0))
-    all_f1.append(f1_score(y_te, pred, zero_division=0))
-    all_auc.append(roc_auc_score(y_te, prob))
 
-    last_y_te, last_pred, last_prob = y_te, pred, prob
-    print(f"  Fold {fold} — Acc: {all_acc[-1]:.3f}  Prec: {all_prec[-1]:.3f}  "
-          f"Rec: {all_rec[-1]:.3f}  F1: {all_f1[-1]:.3f}  AUC: {all_auc[-1]:.3f}")
+def pressure_trend(series: pd.Series) -> str:
+    """Compare mean of early half vs late half of pressure series."""
+    valid = series.dropna()
+    if len(valid) < 3:
+        return "Insufficient Data"
+    half  = len(valid) // 2
+    delta = valid.iloc[half:].mean() - valid.iloc[:half].mean()
+    if delta > 1.5:
+        return "Rising ↑"
+    if delta < -1.5:
+        return "Falling ↓"
+    return "Stable →"
 
-class_metrics = {}
-if all_acc:
-    class_metrics = {
-        "accuracy":  round(float(np.mean(all_acc)),  4),
-        "precision": round(float(np.mean(all_prec)), 4),
-        "recall":    round(float(np.mean(all_rec)),  4),
-        "f1":        round(float(np.mean(all_f1)),   4),
-        "roc_auc":   round(float(np.mean(all_auc)),  4),
-    }
-    print(f"\nCV Mean — Accuracy: {class_metrics['accuracy']}  "
-          f"Precision: {class_metrics['precision']}  "
-          f"Recall: {class_metrics['recall']}  "
-          f"F1: {class_metrics['f1']}  "
-          f"AUC: {class_metrics['roc_auc']}")
-else:
-    class_metrics["note"] = "All folds skipped — dataset may be too small or heavily imbalanced."
-    print("⚠️", class_metrics["note"])
 
-# Confusion matrix on last valid fold
-if last_y_te is not None:
-    from sklearn.metrics import confusion_matrix
-    cm = confusion_matrix(last_y_te, last_pred)
-    fig, ax = plt.subplots()
-    im = ax.imshow(cm, cmap="Blues")
-    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
-    ax.set_xticklabels(["No Rain", "Rain"])
-    ax.set_yticklabels(["No Rain", "Rain"])
-    for i in range(2):
-        for j in range(2):
-            ax.text(j, i, cm[i, j], ha="center", va="center", color="black")
-    ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
-    ax.set_title("Confusion Matrix (last valid fold)")
-    plt.colorbar(im)
+def condition_rating(ci: float | None, rain_prob: float | None,
+                     hi: float | None, temp_f: float | None) -> str:
+    """Composite label from comfort index, rain probability, and extremes."""
+    if ci is None:
+        return "Unknown"
+    score = ci
+    if rain_prob is not None:
+        score -= rain_prob * 0.3
+    if hi is not None and hi > 103:
+        score -= 20
+    if temp_f is not None and temp_f < 32:
+        score -= 25
+    score = max(0, min(100, score))
+    if score >= 80: return "Excellent ★★★★★"
+    if score >= 65: return "Good     ★★★★☆"
+    if score >= 50: return "Fair     ★★★☆☆"
+    if score >= 30: return "Poor     ★★☆☆☆"
+    return             "Severe   ★☆☆☆☆"
+
+
+# ─────────────────────────────────────────────────────────────
+#  5.  Build sklearn pipelines
+# ─────────────────────────────────────────────────────────────
+def build_pipelines():
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler",  StandardScaler()),
+    ])
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot",  OneHotEncoder(handle_unknown="ignore")),
+    ])
+    preprocessor = ColumnTransformer([
+        ("num", numeric_transformer,     NUMERIC_FEATURES),
+        ("cat", categorical_transformer, CATEGORICAL_FEATURES),
+    ])
+
+    clf_pipeline = ImbPipeline([
+        ("preprocessor", preprocessor),
+        ("smote",        SMOTE(random_state=42, k_neighbors=3)),
+        ("model",        RandomForestClassifier(
+            n_estimators=300,
+            class_weight="balanced",
+            max_features="sqrt",
+            min_samples_leaf=5,
+            random_state=42,
+        )),
+    ])
+
+    reg_pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ("model",        RandomForestRegressor(n_estimators=200, random_state=42)),
+    ])
+    return clf_pipeline, reg_pipeline
+
+
+# ─────────────────────────────────────────────────────────────
+#  6.  Training
+# ─────────────────────────────────────────────────────────────
+def train(train_paths: list[str], output_dir: str) -> tuple:
+    print(f"\n{'='*60}")
+    print("  TRAINING PHASE")
+    print(f"{'='*60}")
+
+    frames = []
+    for path in train_paths:
+        print(f"  Loading: {path}")
+        raw = pd.read_csv(path)
+        std = standardize_weather_df(raw, source_name=os.path.basename(path))
+        frames.append(std)
+
+    train_df = pd.concat(frames, ignore_index=True)
+    print(f"\n  Combined training rows : {len(train_df)}")
+    print(f"  Rain rows              : {int(train_df['rain_flag'].sum())}")
+    print(f"  Rain frequency         : {train_df['rain_flag'].mean()*100:.2f} %")
+    print(f"  Avg temperature        : {train_df['temperature'].mean():.2f}")
+    print(f"  Avg humidity           : {train_df['humidity'].mean():.2f}")
+
+    X       = train_df[FEATURE_COLS].copy()
+    y_class = train_df["rain_flag"].astype(int)
+    y_reg   = train_df["rain_amount"].astype(float)
+
+    clf_pipeline, reg_pipeline = build_pipelines()
+
+    # ── Time-series cross-validation
+    tscv = TimeSeriesSplit(n_splits=5)
+    all_acc, all_prec, all_rec, all_f1, all_auc = [], [], [], [], []
+    last_y_te = last_pred = last_prob = None
+
+    print(f"\n  Cross-validation (TimeSeriesSplit, 5 folds)")
+    for fold, (tr_idx, te_idx) in enumerate(tscv.split(X), 1):
+        X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+        y_tr, y_te = y_class.iloc[tr_idx], y_class.iloc[te_idx]
+        if len(y_tr.unique()) < 2 or len(y_te.unique()) < 2:
+            print(f"    Fold {fold} – skipped (single class)")
+            continue
+        clf_pipeline.fit(X_tr, y_tr)
+        pred = clf_pipeline.predict(X_te)
+        prob = clf_pipeline.predict_proba(X_te)[:, 1]
+        all_acc.append(accuracy_score(y_te, pred))
+        all_prec.append(precision_score(y_te, pred, zero_division=0))
+        all_rec.append(recall_score(y_te, pred, zero_division=0))
+        all_f1.append(f1_score(y_te, pred, zero_division=0))
+        all_auc.append(roc_auc_score(y_te, prob))
+        last_y_te, last_pred, last_prob = y_te, pred, prob
+        print(f"    Fold {fold} – Acc={all_acc[-1]:.3f}  Prec={all_prec[-1]:.3f}"
+              f"  Rec={all_rec[-1]:.3f}  F1={all_f1[-1]:.3f}  AUC={all_auc[-1]:.3f}")
+
+    class_metrics: dict = {}
+    if all_acc:
+        class_metrics = {
+            "accuracy":  round(float(np.mean(all_acc)),  4),
+            "precision": round(float(np.mean(all_prec)), 4),
+            "recall":    round(float(np.mean(all_rec)),  4),
+            "f1":        round(float(np.mean(all_f1)),   4),
+            "roc_auc":   round(float(np.mean(all_auc)),  4),
+        }
+        print(f"\n  CV Mean → Acc={class_metrics['accuracy']}  Prec={class_metrics['precision']}"
+              f"  Rec={class_metrics['recall']}  F1={class_metrics['f1']}  AUC={class_metrics['roc_auc']}")
+    else:
+        class_metrics["note"] = "All folds skipped – too small or heavily imbalanced."
+        print("  ⚠  All folds skipped.")
+
+    # Final fit on all training data
+    clf_pipeline.fit(X, y_class)
+
+    # ── Regression (rain-only rows)
+    reg_metrics: dict = {}
+    rain_mask = y_reg > 0
+    if rain_mask.sum() > 10:
+        reg_pipeline.fit(X[rain_mask], y_reg[rain_mask])
+        pred_r = reg_pipeline.predict(X[rain_mask])
+        reg_metrics["mae"] = round(mean_absolute_error(y_reg[rain_mask], pred_r), 4)
+        reg_metrics["r2"]  = round(r2_score(y_reg[rain_mask], pred_r), 4)
+        print(f"\n  Regressor – MAE={reg_metrics['mae']}  R²={reg_metrics['r2']}")
+    else:
+        reg_pipeline.fit(X, y_reg)
+        reg_metrics["note"] = "Not enough rain rows for reliable regression."
+
+    # ── Save models
+    joblib.dump(clf_pipeline, os.path.join(output_dir, "rain_classifier.joblib"))
+    joblib.dump(reg_pipeline, os.path.join(output_dir, "rain_regressor.joblib"))
+    with open(os.path.join(output_dir, "model_metrics.json"), "w") as f:
+        json.dump({"classification": class_metrics, "regression": reg_metrics}, f, indent=2)
+
+    # ── Confusion matrix plot
+    if last_y_te is not None:
+        from sklearn.metrics import confusion_matrix
+        cm = confusion_matrix(last_y_te, last_pred)
+        fig, ax = plt.subplots()
+        im = ax.imshow(cm, cmap="Blues")
+        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+        ax.set_xticklabels(["No Rain", "Rain"])
+        ax.set_yticklabels(["No Rain", "Rain"])
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, cm[i, j], ha="center", va="center")
+        ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+        ax.set_title("Confusion Matrix (last fold)")
+        plt.colorbar(im); plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=200)
+        plt.close()
+
+    # ── Temperature vs rain scatter plot (training)
+    plt.figure(figsize=(8, 5))
+    plot_df = train_df.dropna(subset=["temperature", "rain_amount"])
+    plt.scatter(plot_df["temperature"], plot_df["rain_amount"], alpha=0.5)
+    plt.xlabel("Temperature"); plt.ylabel("Rain Amount")
+    plt.title("Temperature vs Rain Amount (training)")
     plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix.png"), dpi=200)
-    plt.show()
+    plt.savefig(os.path.join(output_dir, "temp_vs_rain.png"), dpi=200)
+    plt.close()
 
-# Final fit on ALL training data
-clf_pipeline.fit(X, y_class)
-
-# Regression
-reg_metrics = {}
-if y_reg.notna().sum() > 10:
-    X_rain  = X[y_reg > 0]
-    y_rain  = y_reg[y_reg > 0]
-    reg_pipeline.fit(X_rain, y_rain)
-    pred_r = reg_pipeline.predict(X_rain)
-    reg_metrics["mae"] = round(mean_absolute_error(y_rain, pred_r), 4)
-    reg_metrics["r2"]  = round(r2_score(y_rain, pred_r), 4)
-    print(f"Regressor (rain-only rows) — MAE: {reg_metrics['mae']}  R²: {reg_metrics['r2']}")
-else:
-    reg_pipeline.fit(X, y_reg)
-    reg_metrics["note"] = "Not enough rain rows for reliable regression metrics."
-
-joblib.dump(clf_pipeline, os.path.join(OUTPUT_DIR, "rain_classifier.joblib"))
-joblib.dump(reg_pipeline, os.path.join(OUTPUT_DIR, "rain_regressor.joblib"))
-
-metrics_path = os.path.join(OUTPUT_DIR, "model_metrics.json")
-with open(metrics_path, "w") as f:
-    json.dump({"classification": class_metrics, "regression": reg_metrics}, f, indent=2)
-
-print("Classification metrics:", class_metrics)
-print("Regression metrics:",     reg_metrics)
+    return clf_pipeline, reg_pipeline, train_df
 
 
-# =========================
-# 10) Analyze new input CSV
-# =========================
-input_raw = load_csv_from_uploaded(input_file_name, uploaded_input)
-input_std = standardize_weather_df(input_raw, source_name=input_file_name)
+# ─────────────────────────────────────────────────────────────
+#  7.  Inference + index computation
+# ─────────────────────────────────────────────────────────────
+def analyze(test_path: str, clf_pipeline, reg_pipeline,
+            train_df: pd.DataFrame, output_dir: str):
+    print(f"\n{'='*60}")
+    print("  ANALYSIS PHASE")
+    print(f"{'='*60}")
+    print(f"  Test file: {test_path}")
 
-X_new = input_std[feature_cols].copy()
+    raw      = pd.read_csv(test_path)
+    input_std = standardize_weather_df(raw, source_name=os.path.basename(test_path))
+    X_new    = input_std[FEATURE_COLS].copy()
 
-input_std["predicted_rain_probability"] = clf_pipeline.predict_proba(X_new)[:, 1]
-input_std["predicted_rain_flag"]        = clf_pipeline.predict(X_new)
-input_std["predicted_rain_amount"]      = reg_pipeline.predict(X_new)
+    # ── ML predictions
+    input_std["predicted_rain_probability"] = clf_pipeline.predict_proba(X_new)[:, 1]
+    input_std["predicted_rain_flag"]        = clf_pipeline.predict(X_new)
+    input_std["predicted_rain_amount"]      = reg_pipeline.predict(X_new)
 
-predictions_path = os.path.join(OUTPUT_DIR, "input_predictions.csv")
-input_std.to_csv(predictions_path, index=False)
-display(input_std.head())
+    # ── Meteorological indices
+    # temperature column may be °F or °C depending on source – keep as-is (matches training)
+    temp_series = input_std["temperature"]
+    hum_series  = input_std["humidity"]
+    wind_series = input_std["wind_speed"]
+    pres_series = input_std["pressure"]
+
+    input_std["heat_index"] = [
+        heat_index(t, h) for t, h in zip(temp_series, hum_series)
+    ]
+    input_std["wind_chill"] = [
+        wind_chill(t, w) for t, w in zip(temp_series, wind_series)
+    ]
+    input_std["comfort_index"] = [
+        comfort_index(t, h, w) for t, h, w in zip(temp_series, hum_series, wind_series)
+    ]
+    input_std["pressure_trend"] = pressure_trend(pres_series)
+
+    input_std["condition_rating"] = [
+        condition_rating(ci, rp * 100, hi, tf)
+        for ci, rp, hi, tf in zip(
+            input_std["comfort_index"],
+            input_std["predicted_rain_probability"],
+            input_std["heat_index"],
+            temp_series,
+        )
+    ]
+
+    # ── Console summary
+    print(f"\n  Rows analyzed              : {len(input_std)}")
+    print(f"  Avg temperature            : {temp_series.mean():.2f}")
+    print(f"  Avg humidity               : {hum_series.mean():.2f}")
+    print(f"  Avg heat index             : {input_std['heat_index'].dropna().mean():.2f}")
+    print(f"  Avg wind chill             : {input_std['wind_chill'].dropna().mean():.2f}")
+    print(f"  Avg comfort index          : {input_std['comfort_index'].dropna().mean():.2f}")
+    print(f"  Avg rain probability       : {input_std['predicted_rain_probability'].mean()*100:.2f} %")
+    print(f"  Predicted rain-positive    : {int(input_std['predicted_rain_flag'].sum())}")
+    print(f"  Pressure trend             : {input_std['pressure_trend'].iloc[0]}")
+    print(f"\n  Sample condition ratings:")
+    for _, row in input_std.head(5).iterrows():
+        print(f"    row {int(row.name)+1:>4} | "
+              f"T={row['temperature']:.1f}  H={row['humidity']:.1f}  "
+              f"HI={row['heat_index']}  CI={row['comfort_index']}  "
+              f"Rain%={row['predicted_rain_probability']*100:.0f}  "
+              f"→ {row['condition_rating']}")
+
+    # Historical comparison
+    hist_rain_temp = train_df.loc[train_df["rain_flag"] == 1, "temperature"].dropna()
+    if len(hist_rain_temp) > 0 and temp_series.notna().sum() > 0:
+        diff = temp_series.mean() - hist_rain_temp.mean()
+        print(f"\n  Historical avg temp when raining : {hist_rain_temp.mean():.2f}")
+        print(f"  Difference (test mean – hist)    : {diff:+.2f}")
+
+    # ── Save predictions CSV
+    pred_path = os.path.join(output_dir, "input_predictions.csv")
+    input_std.to_csv(pred_path, index=False)
+    print(f"\n  Predictions saved → {pred_path}")
+
+    # ── Save analysis text report
+    report_lines = [
+        f"Input file            : {test_path}",
+        f"Rows analyzed         : {len(input_std)}",
+        f"Avg temperature       : {temp_series.mean():.2f}",
+        f"Avg humidity          : {hum_series.mean():.2f}",
+        f"Avg heat index        : {input_std['heat_index'].dropna().mean():.2f}",
+        f"Avg wind chill        : {input_std['wind_chill'].dropna().mean():.2f}",
+        f"Avg comfort index     : {input_std['comfort_index'].dropna().mean():.2f}",
+        f"Avg rain probability  : {input_std['predicted_rain_probability'].mean()*100:.2f} %",
+        f"Rain-positive rows    : {int(input_std['predicted_rain_flag'].sum())}",
+        f"Pressure trend        : {input_std['pressure_trend'].iloc[0]}",
+    ]
+    with open(os.path.join(output_dir, "input_analysis_report.txt"), "w") as f:
+        f.write("\n".join(report_lines))
+
+    # ── Plot: temperature vs predicted rain probability
+    plt.figure(figsize=(8, 5))
+    plot_df = input_std.dropna(subset=["temperature", "predicted_rain_probability"])
+    plt.scatter(plot_df["temperature"], plot_df["predicted_rain_probability"], alpha=0.5)
+    plt.axhline(0.5, color="red", linestyle="--", linewidth=0.8, label="Decision boundary")
+    plt.xlabel("Temperature"); plt.ylabel("Predicted Rain Probability")
+    plt.title("Input: Temperature vs Predicted Rain Probability")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "input_temp_vs_pred_rain_prob.png"), dpi=200)
+    plt.close()
+
+    # ── Plot: comfort & heat index over rows
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(input_std.index, input_std["comfort_index"],  label="Comfort Index",  color="steelblue")
+    ax.plot(input_std.index, input_std["heat_index"],     label="Heat Index",     color="tomato",     alpha=0.7)
+    ax.plot(input_std.index, input_std["wind_chill"],     label="Wind Chill",     color="mediumseagreen", alpha=0.7)
+    ax.set_xlabel("Row"); ax.set_ylabel("Index value (°F / 0-100)")
+    ax.set_title("Weather Indices per Row")
+    ax.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "weather_indices.png"), dpi=200)
+    plt.close()
+
+    # ── Time-series plot if timestamps available
+    if input_std["timestamp"].notna().sum() > 0:
+        inp_sorted = input_std.sort_values("timestamp")
+        fig, ax1 = plt.subplots(figsize=(12, 4))
+        ax1.plot(inp_sorted["timestamp"], inp_sorted["predicted_rain_probability"],
+                 color="steelblue", label="Rain Probability")
+        ax1.axhline(0.5, color="red", linestyle="--", linewidth=0.8, label="Threshold")
+        ax1.set_ylabel("Rain Probability"); ax1.set_ylim(0, 1)
+        ax2 = ax1.twinx()
+        ax2.plot(inp_sorted["timestamp"], inp_sorted["temperature"],
+                 color="orange", alpha=0.5, label="Temperature")
+        ax2.set_ylabel("Temperature")
+        h1, l1 = ax1.get_legend_handles_labels()
+        h2, l2 = ax2.get_legend_handles_labels()
+        ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+        ax1.set_title("Rain Probability & Temperature Over Time")
+        plt.xticks(rotation=45); plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "rain_timeseries.png"), dpi=200)
+        plt.close()
+
+    return input_std
 
 
-# =========================
-# 11) Input analysis report
-# =========================
-input_lines = []
-input_lines.append(f"Input file: {input_file_name}")
-input_lines.append(f"Rows analyzed: {len(input_std)}")
+# ─────────────────────────────────────────────────────────────
+#  8.  CLI entry-point
+# ─────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Weather ML Pipeline – train + predict comfort/heat/rain/wind-chill/pressure indices"
+    )
+    parser.add_argument(
+        "--train", nargs="+", required=True,
+        help="1–6 training CSV file paths"
+    )
+    parser.add_argument(
+        "--test", required=True,
+        help="Test CSV file path to analyze"
+    )
+    parser.add_argument(
+        "--output", default="weather_results",
+        help="Output directory (default: weather_results/)"
+    )
+    args = parser.parse_args()
 
-for col, label in [("temperature", "temperature"), ("humidity", "humidity")]:
-    if input_std[col].notna().sum() > 0:
-        input_lines.append(f"Average input {label}: {input_std[col].mean():.2f}")
+    # Validate inputs
+    for p in args.train:
+        if not os.path.isfile(p):
+            sys.exit(f"Training file not found: {p}")
+    if not os.path.isfile(args.test):
+        sys.exit(f"Test file not found: {args.test}")
+    if len(args.train) > 6:
+        print(f"⚠  More than 6 training files supplied – using first 6.")
+        args.train = args.train[:6]
 
-input_lines.append(f"Average predicted rain probability: "
-                   f"{input_std['predicted_rain_probability'].mean():.4f}")
-input_lines.append(f"Predicted rain-positive rows: "
-                   f"{int(input_std['predicted_rain_flag'].sum())}")
-input_lines.append(f"Average predicted rain amount: "
-                   f"{input_std['predicted_rain_amount'].mean():.4f}")
+    os.makedirs(args.output, exist_ok=True)
+    print(f"\n  Output directory: {args.output}")
 
-hist_rain_temp = train_df.loc[train_df["rain_flag"] == 1, "temperature"].dropna()
-if len(hist_rain_temp) > 0 and input_std["temperature"].notna().sum() > 0:
-    input_lines.append(f"Historical raining temp mean: {hist_rain_temp.mean():.2f}")
-    input_lines.append(f"Difference (input mean temp vs historical raining temp): "
-                       f"{input_std['temperature'].mean() - hist_rain_temp.mean():.2f}")
+    # Run pipeline
+    clf_pipeline, reg_pipeline, train_df = train(args.train, args.output)
+    analyze(args.test, clf_pipeline, reg_pipeline, train_df, args.output)
 
-input_report_path = os.path.join(OUTPUT_DIR, "input_analysis_report.txt")
-with open(input_report_path, "w") as f:
-    f.write("\n".join(input_lines))
-
-print("\n".join(input_lines))
-
-
-# =========================
-# 12) Plot predictions for input
-# =========================
-plt.figure(figsize=(8, 5))
-pred_plot_df = input_std.dropna(subset=["temperature", "predicted_rain_probability"])
-plt.scatter(pred_plot_df["temperature"], pred_plot_df["predicted_rain_probability"], alpha=0.5)
-plt.axhline(0.5, color="red", linestyle="--", linewidth=0.8, label="Decision boundary")
-plt.xlabel("Temperature")
-plt.ylabel("Predicted Rain Probability")
-plt.title("Input: Temperature vs Predicted Rain Probability")
-plt.legend()
-plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "input_temp_vs_pred_rain_prob.png"), dpi=200)
-plt.show()
-
-# Time-series plot if timestamp available
-if input_std["timestamp"].notna().sum() > 0:
-    input_sorted = input_std.sort_values("timestamp")
-    fig, ax1 = plt.subplots(figsize=(12, 4))
-    ax1.plot(input_sorted["timestamp"], input_sorted["predicted_rain_probability"],
-             color="steelblue", label="Rain Probability")
-    ax1.axhline(0.5, color="red", linestyle="--", linewidth=0.8, label="Decision boundary")
-    ax1.set_ylabel("Rain Probability"); ax1.set_ylim(0, 1)
-    ax2 = ax1.twinx()
-    ax2.plot(input_sorted["timestamp"], input_sorted["temperature"],
-             color="orange", alpha=0.5, label="Temperature")
-    ax2.set_ylabel("Temperature")
-    handles = ax1.get_legend_handles_labels()[0] + ax2.get_legend_handles_labels()[0]
-    labels  = ax1.get_legend_handles_labels()[1] + ax2.get_legend_handles_labels()[1]
-    ax1.legend(handles, labels, loc="upper left")
-    ax1.set_title("Rain Probability & Temperature Over Time")
-    plt.xticks(rotation=45); plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "rain_timeseries.png"), dpi=200)
-    plt.show()
+    print(f"\n{'='*60}")
+    print("  Generated files:")
+    for f in sorted(os.listdir(args.output)):
+        print(f"    {f}")
+    print(f"{'='*60}\n")
 
 
-# =========================
-# 13) Download results
-# =========================
-print("Generated files:")
-for f in sorted(os.listdir(OUTPUT_DIR)):
-    print("-", f)
+if __name__ == "__main__":
+    main()
 
-import shutil
-zip_path = shutil.make_archive("weather_results_bundle", "zip", OUTPUT_DIR)
-files.download(zip_path)
+
+
